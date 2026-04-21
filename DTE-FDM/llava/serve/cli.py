@@ -95,42 +95,85 @@ class DomainTagGenerator:
         return label, probs, cam
 
 
-def save_confidence_map(image_path, cam, probs, save_path, verdict):
-    """Overlay GradCAM heatmap on the original image and save as JPEG.
+def extract_clip_attention(image_path, model):
+    """Extract last-layer CLIP ViT attention averaged over heads (CLS → patches).
+
+    Returns:
+        attn (np.ndarray): shape (H_patches, W_patches), normalised to [0, 1]
+    """
+    vision_tower = model.get_model().get_vision_tower()
+    clip_model = vision_tower.vision_tower
+    processor = vision_tower.image_processor
+
+    image = Image.open(image_path).convert('RGB')
+    pixel_values = processor(images=image, return_tensors='pt')['pixel_values']
+    pixel_values = pixel_values.to(device=vision_tower.device, dtype=vision_tower.dtype)
+
+    with torch.no_grad():
+        outputs = clip_model(pixel_values, output_attentions=True)
+
+    # attentions: tuple(num_layers) of (1, num_heads, seq_len, seq_len)
+    # seq_len = 1 CLS + num_patches
+    last_attn = outputs.attentions[-1]       # (1, heads, seq_len, seq_len)
+    cls_attn = last_attn[0, :, 0, 1:]       # (heads, num_patches)  — CLS row only
+    cls_attn = cls_attn.mean(dim=0).cpu().float().numpy()  # (num_patches,)
+
+    n = int(cls_attn.shape[0] ** 0.5)
+    cls_attn = cls_attn.reshape(n, n)
+    cls_attn = (cls_attn - cls_attn.min()) / (cls_attn.max() - cls_attn.min() + 1e-8)
+    return cls_attn
+
+
+def save_confidence_map(image_path, cam, probs, save_path, verdict, clip_attn=None):
+    """Overlay GradCAM heatmap (and optionally CLIP attention) on the original image.
 
     Args:
         image_path: path to the original input image
-        cam: GradCAM array shape (224, 224), values in [0, 1]
-        probs: softmax probabilities array shape (3,)
+        cam: DTG GradCAM array shape (224, 224), values in [0, 1]
+        probs: DTG softmax probabilities array shape (3,)
         save_path: output file path (.jpg)
         verdict: 'Tampered' or 'Not Tampered'
+        clip_attn: optional CLIP ViT attention map shape (H_p, W_p), values in [0, 1]
     """
     orig = np.array(Image.open(image_path).convert('RGB'))
     orig_h, orig_w = orig.shape[:2]
 
-    # Upsample cam to original image resolution for full-detail overlay
+    # DTG GradCAM overlay (JET colormap)
     cam_full = cv2.resize(cam, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
     heatmap = cv2.applyColorMap(np.uint8(255 * cam_full), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-    overlay = np.clip(0.55 * orig + 0.45 * heatmap, 0, 255).astype(np.uint8)
+    dtg_overlay = np.clip(0.55 * orig + 0.45 * heatmap, 0, 255).astype(np.uint8)
 
     prob_lines = [f'{n}: {p:.1%}' for n, p in zip(CLASS_NAMES, probs)]
     prob_text = '\n'.join(prob_lines)
-    title_overlay = f'DTG GradCAM — Verdict: {verdict}\n{prob_text}'
+    title_dtg = f'DTG GradCAM — Verdict: {verdict}\n{prob_text}'
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    n_panels = 3 if clip_attn is not None else 2
+    fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 7))
+
     axes[0].imshow(orig)
     axes[0].set_title('Original Image', fontsize=13)
     axes[0].axis('off')
 
-    im = axes[1].imshow(overlay)
-    axes[1].set_title(title_overlay, fontsize=11)
+    axes[1].imshow(dtg_overlay)
+    axes[1].set_title(title_dtg, fontsize=11)
     axes[1].axis('off')
+    sm_jet = plt.cm.ScalarMappable(cmap='jet', norm=plt.Normalize(vmin=0, vmax=1))
+    sm_jet.set_array([])
+    plt.colorbar(sm_jet, ax=axes[1], fraction=0.03, pad=0.02, label='DTG activation intensity')
 
-    # Colorbar showing confidence intensity
-    sm = plt.cm.ScalarMappable(cmap='jet', norm=plt.Normalize(vmin=0, vmax=1))
-    sm.set_array([])
-    plt.colorbar(sm, ax=axes[1], fraction=0.03, pad=0.02, label='Activation intensity')
+    if clip_attn is not None:
+        # CLIP attention overlay (INFERNO colormap — visually distinct from JET)
+        attn_full = cv2.resize(clip_attn, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        attn_heatmap = cv2.applyColorMap(np.uint8(255 * attn_full), cv2.COLORMAP_INFERNO)
+        attn_heatmap = cv2.cvtColor(attn_heatmap, cv2.COLOR_BGR2RGB)
+        clip_overlay = np.clip(0.55 * orig + 0.45 * attn_heatmap, 0, 255).astype(np.uint8)
+        axes[2].imshow(clip_overlay)
+        axes[2].set_title('LLaVA CLIP Attention\n(regions LLaVA focused on)', fontsize=11)
+        axes[2].axis('off')
+        sm_inf = plt.cm.ScalarMappable(cmap='inferno', norm=plt.Normalize(vmin=0, vmax=1))
+        sm_inf.set_array([])
+        plt.colorbar(sm_inf, ax=axes[2], fraction=0.03, pad=0.02, label='CLIP attention intensity')
 
     plt.tight_layout()
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
@@ -256,12 +299,13 @@ def DTE_FDM_cli(args):
 
     print("======== The detection result is saved to {} ========".format(args.output_path))
 
-    # Save GradCAM confidence map when image is judged as not tampered
+    # Save GradCAM + CLIP attention map when image is judged as not tampered
     not_tampered = "has not been tampered with" in outputs.lower()
     if not_tampered:
         base = os.path.splitext(args.output_path)[0]
         conf_path = base + '_confidence.jpg'
-        save_confidence_map(image_path, cam, probs, conf_path, verdict='Not Tampered')
+        clip_attn = extract_clip_attention(image_path, model)
+        save_confidence_map(image_path, cam, probs, conf_path, verdict='Not Tampered', clip_attn=clip_attn)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
