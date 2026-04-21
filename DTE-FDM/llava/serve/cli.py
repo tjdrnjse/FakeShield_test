@@ -302,8 +302,9 @@ def DTE_FDM_cli(args):
     # Save GradCAM + CLIP attention map when image is judged as not tampered
     not_tampered = "has not been tampered with" in outputs.lower()
     if not_tampered:
-        base = os.path.splitext(args.output_path)[0]
-        conf_path = base + '_confidence.jpg'
+        img_stem = os.path.splitext(os.path.basename(image_path))[0]
+        out_dir = os.path.dirname(os.path.abspath(args.output_path))
+        conf_path = os.path.join(out_dir, f'{img_stem}_confidence.jpg')
         clip_attn = extract_clip_attention(image_path, model)
         save_confidence_map(image_path, cam, probs, conf_path, verdict='Not Tampered', clip_attn=clip_attn)
 
