@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mmengine.model import BaseModule
-from mmengine.model.utils.weight_init import normal_init
+from mmcv.cnn.utils.weight_init import normal_init
 from mmcv.cnn import ConvModule
 from mmcv import ops
 
