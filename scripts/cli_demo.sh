@@ -4,7 +4,7 @@ DTE_FDM_OUTPUT=./playground/DTE-FDM_output.jsonl
 MFLM_OUTPUT=./playground/MFLM_output
 
 pip install -q transformers==4.37.2  > /dev/null 2>&1
-CUDA_VISIBLE_DEVICES=0 \
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=./DTE-FDM:${PYTHONPATH} \
 python -m llava.serve.cli \
     --model-path  ${WEIGHT_PATH}/DTE-FDM \
     --DTG-path ${WEIGHT_PATH}/DTG.pth \

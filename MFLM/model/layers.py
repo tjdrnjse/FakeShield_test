@@ -6,9 +6,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mmengine.model import BaseModule
-from mmcv.cnn.utils.weight_init import normal_init
 from mmcv.cnn import ConvModule
 from mmcv import ops
+
+
+def normal_init(module, mean=0, std=1, bias=0):
+    """Initialize module weights/bias with a normal distribution (pure PyTorch)."""
+    if hasattr(module, 'weight') and module.weight is not None:
+        nn.init.normal_(module.weight, mean, std)
+    if hasattr(module, 'bias') and module.bias is not None:
+        nn.init.constant_(module.bias, bias)
 
 
 def str2reg(input_str):
