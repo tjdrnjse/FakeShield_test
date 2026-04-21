@@ -5,8 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mmdet.models import BaseRoIExtractor
-from mmcv.cnn import ConvModule, Linear, normal_init
+from mmengine.model import BaseModule
+from mmengine.model.utils.weight_init import normal_init
+from mmcv.cnn import ConvModule
+from mmcv import ops
 
 
 def str2reg(input_str):
@@ -28,7 +30,7 @@ class MLP(nn.Module):
         self.num_layers = num_layers
         h = [hidden_dim] * (num_layers - 1)
         self.layers = nn.ModuleList(
-            Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+            nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
 
     def forward(self, x):
         for i, layer in enumerate(self.layers):
@@ -201,8 +203,8 @@ class MLVLROIQueryModule(nn.Module):
         self.mlvl_fuse = MLVLFuseModule(input_dims=embed_dims,
                                         embed_dims=embed_dims,
                                         num_levels=num_levels,
-                                        num_fuse=5)    
-        strids = [14 / 8, 14 / 4, 14 / 2, 14] 
+                                        num_fuse=5)
+        strids = [14 / 8, 14 / 4, 14 / 2, 14]
         assert len(strids) == num_levels
         bbox_roi_extractor = dict(roi_layer=dict(type='RoIAlign',
                                                  output_size=14,
@@ -212,16 +214,16 @@ class MLVLROIQueryModule(nn.Module):
                                   fuse_level=num_levels,
                                   featmap_strides=strids)
 
-        self.roi_align = MlvlRoIExtractor(**bbox_roi_extractor) 
+        self.roi_align = MlvlRoIExtractor(**bbox_roi_extractor)
 
     def forward(self, mlvl_feats, bboxes):
-        if mlvl_feats[0].dim() == 3: 
+        if mlvl_feats[0].dim() == 3:
             h = w = int(math.sqrt(mlvl_feats[0].shape[1]))
             assert h == 24
             assert w == 24
             b, c = mlvl_feats[0].shape[0], mlvl_feats[0].shape[-1]
             mlvl_feats = [item.reshape(b, h, w, c).permute(0, 3, 1, 2) for item in mlvl_feats]
-        
+
         base_shape = mlvl_feats[0].shape[-2:]
         num_level = len(mlvl_feats)
         to_shape = [(base_shape[0] * 2 ** level, base_shape[1] * 2 ** level) for level in range(num_level)]
@@ -239,7 +241,13 @@ class MLVLROIQueryModule(nn.Module):
         return self.roi_align(mlvl_feats, bboxes)
 
 
-class MlvlRoIExtractor(BaseRoIExtractor):
+class MlvlRoIExtractor(BaseModule):
+    """Multi-level RoI feature extractor.
+
+    Migrated from MMCV 1.x BaseRoIExtractor to MMEngine BaseModule.
+    RoI layer construction logic is inlined from the former base class.
+    """
+
     def __init__(self,
                  roi_layer,
                  out_channels,
@@ -250,8 +258,11 @@ class MlvlRoIExtractor(BaseRoIExtractor):
                  fuse_level=3,
                  finest_scale=56,
                  init_cfg=None):
-        super(MlvlRoIExtractor, self).__init__(roi_layer, out_channels,
-                                               featmap_strides, init_cfg)
+        super(MlvlRoIExtractor, self).__init__(init_cfg)
+        # Build roi_layers inline (replaces BaseRoIExtractor.build_roi_layers)
+        self.roi_layers = self._build_roi_layers(roi_layer, featmap_strides)
+        self.out_channels = out_channels
+        self.featmap_strides = featmap_strides
         self.embed_dims = embed_dims
         self.finest_scale = finest_scale
         self.fuse_level = fuse_level
@@ -273,6 +284,19 @@ class MlvlRoIExtractor(BaseRoIExtractor):
         self.flatten_linear = nn.Linear(self.embed_dims * self.roi_layers[0].output_size[0] ** 2, 1024)
 
         self.norm_init_weights()
+
+    def _build_roi_layers(self, layer_cfg, featmap_strides):
+        """Build RoI operator for each feature map level."""
+        cfg = layer_cfg.copy()
+        layer_type = cfg.pop('type')
+        assert hasattr(ops, layer_type), f"mmcv.ops has no attribute '{layer_type}'"
+        layer_cls = getattr(ops, layer_type)
+        return nn.ModuleList(
+            [layer_cls(spatial_scale=1 / s, **cfg) for s in featmap_strides])
+
+    @property
+    def num_inputs(self):
+        return len(self.featmap_strides)
 
     def norm_init_weights(self):
         for m in self.modules():
@@ -332,4 +356,4 @@ class MlvlRoIExtractor(BaseRoIExtractor):
         for i in range(num_imgs):
             mask = rois[:, 0] == i
             query_feats.append(fuse_roi_feats[mask])
-        return query_feats  
+        return query_feats

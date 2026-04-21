@@ -209,11 +209,12 @@ def inference(input_str, all_inputs, follow_up, generate):
     input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
     input_ids = input_ids.unsqueeze(0).cuda()
 
-    # Pass prepared inputs to model
-    output_ids, pred_masks = model.evaluate(
+    # Pass prepared inputs to model; evaluate() returns List[BaseDataElement]
+    data_samples = model.evaluate(
         global_enc_image, grounding_enc_image, input_ids, resize_list, original_size_list, max_tokens_new=512,
         bboxes=bboxes)
-    output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
+    output_ids = data_samples[0].generated_ids[data_samples[0].generated_ids != IMAGE_TOKEN_INDEX]
+    pred_masks = [ds.pred_masks for ds in data_samples if hasattr(ds, 'pred_masks')]
 
     text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
     text_output = text_output.replace("\n", "").replace("  ", " ")
