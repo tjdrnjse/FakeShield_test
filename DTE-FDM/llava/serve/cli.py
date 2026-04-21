@@ -1,5 +1,12 @@
+import os
 import argparse
 import torch
+import torch.nn.functional as F
+import numpy as np
+import cv2
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.conversation import conv_templates, SeparatorStyle
@@ -10,7 +17,6 @@ from llava.mm_utils import process_images, tokenizer_image_token, get_model_name
 from PIL import Image
 
 import requests
-from PIL import Image
 from io import BytesIO
 from transformers import TextStreamer
 import json
@@ -20,15 +26,12 @@ import torch.nn as nn
 from torchvision import transforms
 import time
 
+
+CLASS_NAMES = ['AIGC inpainting', 'DeepFake', 'Photoshop']
+
+
 class DomainTagGenerator:
     def __init__(self, model_path, num_classes=3, device=None):
-        """
-        Initialize the DomainTagGenerator class.
-
-        parameter:
-        - model_path (str): The path to the model weight file.
-        - num_classes (int): The number of categories in the category.
-        - device (torch.device, optional): Device type, such as 'cpu' or 'cuda'.        """
         self.device = device if device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.num_classes = num_classes
 
@@ -46,24 +49,95 @@ class DomainTagGenerator:
         ])
 
     def predict(self, image_path):
-        """
-        Classification prediction of single images.
+        """Run DTG inference with GradCAM.
 
-        parameter:
-        - image_path (str): The path to the image file.
-
-        return:
-        - int: predicted category tags.
+        Returns:
+            label (int): predicted class index (0=AIGC, 1=DeepFake, 2=Photoshop)
+            probs (np.ndarray): softmax probabilities for each class, shape (3,)
+            cam (np.ndarray): GradCAM heatmap normalised to [0, 1], shape (224, 224)
         """
         image = Image.open(image_path).convert('RGB')
-        image = self.transform(image).unsqueeze(0).to(self.device)
+        input_tensor = self.transform(image).unsqueeze(0).to(self.device)
 
-        with torch.no_grad():
-            output = self.model(image)
-            _, predicted = torch.max(output, 1)
-            label = predicted.item()
+        # Closures to capture layer4 activations and gradients for GradCAM
+        _act = [None]
+        _grad = [None]
 
-        return label
+        def fwd_hook(module, inp, out):
+            _act[0] = out
+
+        def bwd_hook(module, grad_in, grad_out):
+            _grad[0] = grad_out[0]
+
+        fwd_h = self.model.layer4.register_forward_hook(fwd_hook)
+        bwd_h = self.model.layer4.register_full_backward_hook(bwd_hook)
+
+        self.model.zero_grad()
+        output = self.model(input_tensor)          # (1, 3)
+        probs = torch.softmax(output, dim=1)[0].detach().cpu().numpy()
+        label = int(output.argmax(dim=1).item())
+
+        # Backprop through the predicted class score to get GradCAM weights
+        output[0, label].backward()
+
+        fwd_h.remove()
+        bwd_h.remove()
+
+        feat = _act[0]   # (1, 2048, 7, 7)
+        grad = _grad[0]  # (1, 2048, 7, 7)
+        weights = grad.mean(dim=(2, 3), keepdim=True)
+        cam = F.relu((weights * feat).sum(dim=1, keepdim=True))
+        cam = F.interpolate(cam, size=(224, 224), mode='bilinear', align_corners=False)
+        cam = cam.squeeze().detach().cpu().float().numpy()
+        cam_min, cam_max = cam.min(), cam.max()
+        cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
+
+        return label, probs, cam
+
+
+def save_confidence_map(image_path, cam, probs, save_path, verdict):
+    """Overlay GradCAM heatmap on the original image and save as JPEG.
+
+    Args:
+        image_path: path to the original input image
+        cam: GradCAM array shape (224, 224), values in [0, 1]
+        probs: softmax probabilities array shape (3,)
+        save_path: output file path (.jpg)
+        verdict: 'Tampered' or 'Not Tampered'
+    """
+    orig = np.array(Image.open(image_path).convert('RGB'))
+    orig_h, orig_w = orig.shape[:2]
+
+    # Upsample cam to original image resolution for full-detail overlay
+    cam_full = cv2.resize(cam, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam_full), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+    overlay = np.clip(0.55 * orig + 0.45 * heatmap, 0, 255).astype(np.uint8)
+
+    prob_lines = [f'{n}: {p:.1%}' for n, p in zip(CLASS_NAMES, probs)]
+    prob_text = '\n'.join(prob_lines)
+    title_overlay = f'DTG GradCAM — Verdict: {verdict}\n{prob_text}'
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    axes[0].imshow(orig)
+    axes[0].set_title('Original Image', fontsize=13)
+    axes[0].axis('off')
+
+    im = axes[1].imshow(overlay)
+    axes[1].set_title(title_overlay, fontsize=11)
+    axes[1].axis('off')
+
+    # Colorbar showing confidence intensity
+    sm = plt.cm.ScalarMappable(cmap='jet', norm=plt.Normalize(vmin=0, vmax=1))
+    sm.set_array([])
+    plt.colorbar(sm, ax=axes[1], fraction=0.03, pad=0.02, label='Activation intensity')
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"======== Confidence map saved to {save_path} ========")
+
 
 def load_image(image_file):
     if image_file.startswith('http://') or image_file.startswith('https://'):
@@ -112,7 +186,9 @@ def DTE_FDM_cli(args):
 
     image_path = args.image_path
     image = load_image(image_path)
-    label = DTG.predict(image_path)
+
+    # DTG: get label, class probabilities, and GradCAM heatmap
+    label, probs, cam = DTG.predict(image_path)
     print("======== DTE_FDM Model Loaded ========")
 
     image_size = image.size
@@ -122,7 +198,6 @@ def DTE_FDM_cli(args):
     else:
         image_tensor = image_tensor.to(model.device, dtype=torch.float16)
 
-    # inp = input(f"{roles[0]}: ")
     inp = "Was this photo taken directly from the camera without any processing? Has it been tampered with by any artificial photo modification techniques such as ps? Please zoom in on any details in the image, paying special attention to the edges of the objects, capturing some unnatural edges and perspective relationships, some incorrect semantics, unnatural lighting and darkness etc."
     if label == 0:
         inp = "This is a picture that is suspected to have been tampered with by AIGC inpainting. " + inp
@@ -134,7 +209,6 @@ def DTE_FDM_cli(args):
     print(f"{roles[1]}: ", end="")
 
     if image is not None:
-        # first message
         if model.config.mm_use_im_start_end:
             inp = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + inp
         else:
@@ -142,7 +216,6 @@ def DTE_FDM_cli(args):
         conv.append_message(conv.roles[0], inp)
         image = None
     else:
-        # later messages
         conv.append_message(conv.roles[0], inp)
     conv.append_message(conv.roles[1], None)
     prompt = conv.get_prompt()
@@ -172,11 +245,23 @@ def DTE_FDM_cli(args):
         print("\n", {"prompt": prompt, "outputs": outputs}, "\n")
 
     outputs = outputs.replace("<s>","").replace("</s>","")
-    
+
+    # Save detection result JSON (now includes DTG probabilities)
     with open(args.output_path, "w") as f:
-        json.dump({"image": image_path, "outputs": outputs}, f)
-    
+        json.dump({
+            "image": image_path,
+            "outputs": outputs,
+            "dtg_probs": {n: float(p) for n, p in zip(CLASS_NAMES, probs)},
+        }, f)
+
     print("======== The detection result is saved to {} ========".format(args.output_path))
+
+    # Save GradCAM confidence map when image is judged as not tampered
+    not_tampered = "has not been tampered with" in outputs.lower()
+    if not_tampered:
+        base = os.path.splitext(args.output_path)[0]
+        conf_path = base + '_confidence.jpg'
+        save_confidence_map(image_path, cam, probs, conf_path, verdict='Not Tampered')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

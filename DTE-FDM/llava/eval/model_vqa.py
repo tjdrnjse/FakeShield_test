@@ -1,6 +1,13 @@
+import os
 import argparse
 import torch
-import os
+import torch.nn.functional as F
+import numpy as np
+import cv2
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 import json
 from tqdm import tqdm
 import shortuuid
@@ -18,15 +25,12 @@ import torchvision.models as models
 import torch.nn as nn
 from torchvision import transforms
 
+
+CLASS_NAMES = ['AIGC inpainting', 'DeepFake', 'Photoshop']
+
+
 class DomainTagGenerator:
     def __init__(self, model_path, num_classes=3, device=None):
-        """
-        Initialize the DomainTagGenerator class.
-
-        parameter:
-        - model_path (str): The path to the model weight file.
-        - num_classes (int): The number of categories in the category.
-        - device (torch.device, optional): Device type, such as 'cpu' or 'cuda'.        """
         self.device = device if device else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.num_classes = num_classes
 
@@ -44,28 +48,81 @@ class DomainTagGenerator:
         ])
 
     def predict(self, image_path):
-        """
-        Classification prediction of single images.
+        """Run DTG inference with GradCAM.
 
-        parameter:
-        - image_path (str): The path to the image file.
-
-        return:
-        - int: predicted category tags.
+        Returns:
+            label (int): predicted class index (0=AIGC, 1=DeepFake, 2=Photoshop)
+            probs (np.ndarray): softmax probabilities, shape (3,)
+            cam (np.ndarray): GradCAM heatmap normalised to [0, 1], shape (224, 224)
         """
         image = Image.open(image_path).convert('RGB')
-        image = self.transform(image).unsqueeze(0).to(self.device)
+        input_tensor = self.transform(image).unsqueeze(0).to(self.device)
 
-        with torch.no_grad():
-            output = self.model(image)
-            _, predicted = torch.max(output, 1)
-            label = predicted.item()
+        _act = [None]
+        _grad = [None]
 
-        return label
+        def fwd_hook(module, inp, out):
+            _act[0] = out
+
+        def bwd_hook(module, grad_in, grad_out):
+            _grad[0] = grad_out[0]
+
+        fwd_h = self.model.layer4.register_forward_hook(fwd_hook)
+        bwd_h = self.model.layer4.register_full_backward_hook(bwd_hook)
+
+        self.model.zero_grad()
+        output = self.model(input_tensor)
+        probs = torch.softmax(output, dim=1)[0].detach().cpu().numpy()
+        label = int(output.argmax(dim=1).item())
+
+        output[0, label].backward()
+        fwd_h.remove()
+        bwd_h.remove()
+
+        feat = _act[0]
+        grad = _grad[0]
+        weights = grad.mean(dim=(2, 3), keepdim=True)
+        cam = F.relu((weights * feat).sum(dim=1, keepdim=True))
+        cam = F.interpolate(cam, size=(224, 224), mode='bilinear', align_corners=False)
+        cam = cam.squeeze().detach().cpu().float().numpy()
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+
+        return label, probs, cam
+
+
+def save_confidence_map(image_path, cam, probs, save_path, verdict):
+    """Overlay GradCAM heatmap on the original image and save as JPEG."""
+    orig = np.array(Image.open(image_path).convert('RGB'))
+    orig_h, orig_w = orig.shape[:2]
+
+    cam_full = cv2.resize(cam, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam_full), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+    overlay = np.clip(0.55 * orig + 0.45 * heatmap, 0, 255).astype(np.uint8)
+
+    prob_lines = [f'{n}: {p:.1%}' for n, p in zip(CLASS_NAMES, probs)]
+    title_overlay = f'DTG GradCAM — Verdict: {verdict}\n' + '\n'.join(prob_lines)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    axes[0].imshow(orig)
+    axes[0].set_title('Original Image', fontsize=13)
+    axes[0].axis('off')
+    axes[1].imshow(overlay)
+    axes[1].set_title(title_overlay, fontsize=11)
+    axes[1].axis('off')
+
+    sm = plt.cm.ScalarMappable(cmap='jet', norm=plt.Normalize(vmin=0, vmax=1))
+    sm.set_array([])
+    plt.colorbar(sm, ax=axes[1], fraction=0.03, pad=0.02, label='Activation intensity')
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
 
 def split_list(lst, n):
-    """Split a list into n (roughly) equal-sized chunks"""
-    chunk_size = math.ceil(len(lst) / n)  # integer division
+    chunk_size = math.ceil(len(lst) / n)
     return [lst[i:i+chunk_size] for i in range(0, len(lst), chunk_size)]
 
 
@@ -75,10 +132,8 @@ def get_chunk(lst, n, k):
 
 
 def eval_model(args):
-    # Model
-    disable_torch_init() 
+    disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
-    # model_name = get_model_name_from_path(model_path)
     model_name = "llava-v1.5-13b"
     DTG = DomainTagGenerator(model_path=args.DTG_path)
     tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
@@ -88,19 +143,26 @@ def eval_model(args):
     answers_file = os.path.expanduser(args.answers_file)
     print(answers_file)
     os.makedirs(os.path.dirname(answers_file), exist_ok=True)
+
+    # Confidence maps saved next to the answers file
+    conf_maps_dir = os.path.join(os.path.dirname(answers_file), 'confidence_maps')
+
     ans_file = open(answers_file, "w")
     print("======== DTE_FDM Detect Begin ========")
     for line in tqdm(questions):
         image_file = line["image"]
         qs = line["text"]
-        label = DTG.predict(image_file)
-        # print(f'Predicted Label for image: {label}')
+
+        # DTG: label + probabilities + GradCAM
+        label, probs, cam = DTG.predict(image_file)
+
         if label == 0:
             qs = "This is a picture that is suspected to have been tampered with by AIGC inpainting. " + qs
         elif label == 1:
             qs = "This is a picture that is suspected to have been tampered with by DeepFake. " + qs
         elif label == 2:
             qs = "This is a picture that is suspected to have been tampered with by Photoshop. " + qs
+
         cur_prompt = qs
         if model.config.mm_use_im_start_end:
             qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
@@ -126,16 +188,26 @@ def eval_model(args):
                 temperature=args.temperature,
                 top_p=args.top_p,
                 num_beams=args.num_beams,
-                # no_repeat_ngram_size=3,
                 max_new_tokens=1024,
                 use_cache=True)
 
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
 
         ans_id = shortuuid.uuid()
-        ans_file.write(json.dumps({"image": image_file,
-                                    "outputs": outputs}) + "\n")
+        ans_file.write(json.dumps({
+            "image": image_file,
+            "outputs": outputs,
+            "dtg_probs": {n: float(p) for n, p in zip(CLASS_NAMES, probs)},
+        }) + "\n")
         ans_file.flush()
+
+        # Save GradCAM confidence map when image is judged as not tampered
+        not_tampered = "has not been tampered with" in outputs.lower()
+        if not_tampered:
+            img_stem = os.path.splitext(os.path.basename(image_file))[0]
+            conf_path = os.path.join(conf_maps_dir, f'{img_stem}_confidence.jpg')
+            save_confidence_map(image_file, cam, probs, conf_path, verdict='Not Tampered')
+
     ans_file.close()
     print("======== The detection result is saved to {} ========".format(args.answers_file))
 
